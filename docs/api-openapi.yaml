@@ -3,7 +3,7 @@ info:
   title: STIGA Product Finder API
   version: "1.0.0"
 servers:
-  - url: https://790536207aac.ngrok-free.app
+  - url: https://f9ade7b53f46.ngrok-free.app
 paths:
   /products/search:
     get:
