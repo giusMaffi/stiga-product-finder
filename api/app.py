@@ -1,8 +1,11 @@
 import os
 import json
-import uuid
+import re
+import time
 from typing import Optional, List, Dict, Any
 
+import requests
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,7 +17,7 @@ from .scoring import score_product
 # Carica variabili d’ambiente
 load_dotenv(dotenv_path=os.path.join("ops", "env.example"))
 
-app = FastAPI(title="STIGA Product Finder API", version="1.0.0")
+app = FastAPI(title="STIGA Product Finder API", version="1.2.0")
 
 # --- CORS ---
 origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
@@ -52,67 +55,103 @@ def load_data():
         PRODUCTS.append(p)
     print(f"✅ Caricati {len(PRODUCTS)} prodotti (scartati {skipped} non-STIGA)")
 
+# --- Live price helpers (cache in-memory) ---
+_LIVE_PRICE_CACHE: Dict[str, Dict[str, Any]] = {}  # url -> {"price": int|None, "ts": float}
+_LIVE_PRICE_TTL = 60 * 30  # 30 minuti
+
+def _parse_price_eur_from_text(text: str) -> Optional[int]:
+    # cerca pattern tipo "2.799 €" / "2799€" / "€ 2.799"
+    candidates = []
+    for m in re.finditer(r"(?:€\s*)?(\d[\d\.\s]{1,7})(?:\s*€)", text, flags=re.MULTILINE):
+        raw = m.group(1)
+        num = int(re.sub(r"[^\d]", "", raw)) if raw else None
+        if num and 100 <= num <= 20000:
+            candidates.append(num)
+    return max(candidates) if candidates else None
+
+def _fetch_live_price(url: str) -> Optional[int]:
+    try:
+        # cache
+        c = _LIVE_PRICE_CACHE.get(url)
+        if c and (time.time() - c["ts"] < _LIVE_PRICE_TTL):
+            return c["price"]
+
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; STIGA-PriceBot/1.0)"}
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code != 200 or not resp.text:
+            _LIVE_PRICE_CACHE[url] = {"price": None, "ts": time.time()}
+            return None
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # 1) meta con price (se presente)
+        meta = soup.find("meta", attrs={"itemprop": "price"}) or soup.find("meta", attrs={"property": "product:price:amount"})
+        if meta and meta.get("content"):
+            try:
+                price = int(float(meta["content"]))
+                _LIVE_PRICE_CACHE[url] = {"price": price, "ts": time.time()}
+                return price
+            except Exception:
+                pass
+
+        # 2) fallback: testo libero con simbolo €
+        text = soup.get_text(separator=" ", strip=True)
+        price = _parse_price_eur_from_text(text)
+        _LIVE_PRICE_CACHE[url] = {"price": price, "ts": time.time()}
+        return price
+    except Exception:
+        _LIVE_PRICE_CACHE[url] = {"price": None, "ts": time.time()}
+        return None
+
 # --- Helpers per la Card ---
-def _noise_value(p: Dict[str, Any]) -> Optional[float]:
-    snd = p.get("sound") or {}
-    return snd.get("lwa_measured_db", snd.get("lwa_guaranteed_db"))
-
-def _perimeter_label(perimeter_type: str) -> str:
-    mapping = {"virtual": "Virtuale", "wire": "Filo", "both": "Virtuale/Filo"}
-    return mapping.get(perimeter_type, perimeter_type)
-
-def _power_label(power: str) -> str:
-    mapping = {"battery": "Batteria", "wire": "Filo", "gasoline": "Benzina"}
-    return mapping.get(power, power)
-
 def build_card(p: Dict[str, Any], score: float) -> Card:
     cov = p.get("coverage_m2", "—")
     slope = p.get("max_slope_pct", "—")
     noise = _noise_value(p)
     perim = _perimeter_label(p.get("perimeter_type", "—"))
-    power = _power_label(p.get("power_source", "—"))
-    price = p.get("price_eur")
+    price_val = p.get("price_eur")
 
+    # prezzo formattato
+    price_str = "—" if price_val is None else f"{int(price_val):,} €".replace(",", ".")
+
+    # specs essenziali
     specs = [
         SpecItem(label_it="Copertura", label_en="Coverage", value=f"{cov} m²"),
         SpecItem(label_it="Pendenza max", label_en="Max slope", value=f"{slope}%"),
         SpecItem(label_it="Perimetro", label_en="Perimeter", value=perim),
-        SpecItem(label_it="Rumorosità", label_en="Noise", value=f"{noise} dB(A)" if noise else "—"),
-        SpecItem(label_it="Alimentazione", label_en="Power source", value=power),
     ]
 
-    pros = []
-    cons = []
-
+    # solo PRO (max 3)
+    pros: List[str] = []
     if p.get("wireless"): pros.append("Connettività wireless")
     if "rtk" in (p.get("features") or []): pros.append("Precisione RTK")
     if "app" in (p.get("features") or []): pros.append("Controllo da app")
-    if "antitheft" in (p.get("features") or []): pros.append("Sistema antifurto")
     if noise and noise <= 60: pros.append("Motore silenzioso")
+    pros = pros[:3]
 
-    if price and price > 1500: cons.append("Prezzo superiore alla media")
-    cons.append("Richiede settaggio iniziale")
-
-    price_obj = Price(label=f"{int(price)} €" if price else "—", note="Prezzo indicativo")
+    price_obj = Price(label=price_str, note=None)
     links = CardLinks(
         pdp={"label_it": "Vedi scheda prodotto", "label_en": "View product page", "url": p.get("pdp_url")},
-        compare={"label_it": "Confronta", "label_en": "Compare", "action": "add_to_compare"},
+        compare={"label_it": "Confronta", "label_en": "Compare", "action": "add_to_compare", "payload": {"id": p.get("id")}},
         lead={"label_it": "Richiedi consulenza", "label_en": "Request consultation", "action": "open_lead_form"}
     )
 
-    subtitle = f"Perfetto per giardini fino a {cov} m² con pendenza {slope}%"
+    # titolo SENZA etichette di punteggio
+    title_clean = p.get("name", "")
+    subtitle = f"{cov} m² • {slope}% • {perim}"
 
     return Card(
-        title=p.get("name", ""),
+        title=title_clean,
         subtitle=subtitle,
         image_url=p.get("image_url"),
         price=price_obj,
         specs=specs,
         pros=pros,
-        cons=cons,
-        score=round(score, 1),
+        cons=[],              # <-- svantaggi rimossi
+        score=round(score, 1),# <-- resta interno per l’ordinamento, ma non lo mostreremo nel testo
         links=links
     )
+
 
 # --- Endpoint base ---
 @app.get("/health")
@@ -134,7 +173,8 @@ def search_products(
     multizone: Optional[bool] = None,
     power_source: str = "any",
     features: Optional[str] = Query(None, description="CSV es: rtk,app,wireless"),
-    limit: int = 5
+    limit: int = 5,
+    live_price: bool = False
 ):
     q = SearchQuery(
         surface_m2=surface_m2,
@@ -148,7 +188,23 @@ def search_products(
         limit=limit
     )
 
+    # 1) filtri duri
     filtered = hard_filters(PRODUCTS, q)
+
+    # 2) opzionale: aggiorna prezzi con lettura live dal PDP
+    if live_price:
+        enriched: List[Dict[str, Any]] = []
+        for p in filtered:
+            p2 = dict(p)  # copia shallow
+            url = p2.get("pdp_url")
+            if url:
+                lp = _fetch_live_price(url)
+                if lp:
+                    p2["price_eur"] = lp
+            enriched.append(p2)
+        filtered = enriched
+
+    # 3) scoring + build card
     scored = [(p, score_product(p, q)) for p in filtered]
     scored.sort(key=lambda x: x[1], reverse=True)
     top = scored[:q.limit]
