@@ -31,6 +31,7 @@ PRODUCTS: List[Dict[str, Any]] = []
 
 @app.on_event("startup")
 def load_data():
+    """Carica i prodotti e scarta quelli con PDP fuori dal dominio STIGA."""
     global PRODUCTS
     data_path = os.path.join("data", "products.json")
     if not os.path.exists(data_path):
@@ -38,8 +39,18 @@ def load_data():
         PRODUCTS = []
         return
     with open(data_path, "r") as f:
-        PRODUCTS = json.load(f)
-    print(f"✅ Caricati {len(PRODUCTS)} prodotti da {data_path}")
+        raw = json.load(f)
+
+    allowed_domains = ("https://www.stiga.com", "https://stiga.com")
+    PRODUCTS = []
+    skipped = 0
+    for p in raw:
+        pdp = p.get("pdp_url", "")
+        if not any(pdp.startswith(dom) for dom in allowed_domains):
+            skipped += 1
+            continue
+        PRODUCTS.append(p)
+    print(f"✅ Caricati {len(PRODUCTS)} prodotti (scartati {skipped} non-STIGA)")
 
 # --- Helpers per la Card ---
 def _noise_value(p: Dict[str, Any]) -> Optional[float]:
