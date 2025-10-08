@@ -17,7 +17,7 @@ from .scoring import score_product
 # Carica variabili d’ambiente
 load_dotenv(dotenv_path=os.path.join("ops", "env.example"))
 
-app = FastAPI(title="STIGA Product Finder API", version="1.2.0")
+app = FastAPI(title="STIGA Product Finder API", version="1.4.0")
 
 # --- CORS ---
 origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
@@ -55,12 +55,72 @@ def load_data():
         PRODUCTS.append(p)
     print(f"✅ Caricati {len(PRODUCTS)} prodotti (scartati {skipped} non-STIGA)")
 
-# --- Live price helpers (cache in-memory) ---
-_LIVE_PRICE_CACHE: Dict[str, Dict[str, Any]] = {}  # url -> {"price": int|None, "ts": float}
-_LIVE_PRICE_TTL = 60 * 30  # 30 minuti
+# -----------------------------
+#       LIVE ENRICHMENT
+# -----------------------------
+_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; STIGA-ProductFinder/1.0)"}
 
-def _parse_price_eur_from_text(text: str) -> Optional[int]:
-    # cerca pattern tipo "2.799 €" / "2799€" / "€ 2.799"
+# cache
+_LIVE_PRICE_CACHE: Dict[str, Dict[str, Any]] = {}   # url -> {"price": int|None, "ts": float}
+_LIVE_IMAGE_CACHE: Dict[str, Dict[str, Any]] = {}   # url -> {"image": str|None, "ts": float}
+_TTL_PRICE = 60 * 30   # 30 minuti
+_TTL_IMAGE = 60 * 60   # 60 minuti
+
+def _get_soup(url: str) -> Optional[BeautifulSoup]:
+    try:
+        resp = requests.get(url, headers=_HEADERS, timeout=12, allow_redirects=True)
+        if resp.status_code >= 400 or not resp.text:
+            return None
+        return BeautifulSoup(resp.text, "html.parser")
+    except Exception:
+        return None
+
+def _parse_jsonld_price_and_image(soup: BeautifulSoup) -> Dict[str, Optional[Any]]:
+    out: Dict[str, Optional[Any]] = {"price": None, "image": None}
+    try:
+        for tag in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(tag.string.strip()) if tag.string else None
+            except Exception:
+                continue
+            if not data:
+                continue
+            # JSON-LD può essere lista o oggetto
+            candidates = data if isinstance(data, list) else [data]
+            for obj in candidates:
+                if not isinstance(obj, dict):
+                    continue
+                # cerca schema Product
+                if obj.get("@type") == "Product":
+                    # image
+                    img = obj.get("image")
+                    if isinstance(img, list) and img:
+                        out["image"] = img[0]
+                    elif isinstance(img, str):
+                        out["image"] = img
+                    # price
+                    offers = obj.get("offers")
+                    if isinstance(offers, dict):
+                        price = offers.get("price") or offers.get("lowPrice")
+                        if isinstance(price, (int, float, str)):
+                            try:
+                                out["price"] = int(float(str(price)))
+                            except Exception:
+                                pass
+                # fallback: oggetti con "offers" anche senza @type preciso
+                if not out["price"] and isinstance(obj.get("offers"), dict):
+                    price = obj["offers"].get("price") or obj["offers"].get("lowPrice")
+                    if isinstance(price, (int, float, str)):
+                        try:
+                            out["price"] = int(float(str(price)))
+                        except Exception:
+                            pass
+    except Exception:
+        pass
+    return out
+
+def _parse_price_from_text(text: str) -> Optional[int]:
+    # pattern: "2.799 €" / "2799€" / "€ 2.799"
     candidates = []
     for m in re.finditer(r"(?:€\s*)?(\d[\d\.\s]{1,7})(?:\s*€)", text, flags=re.MULTILINE):
         raw = m.group(1)
@@ -70,40 +130,73 @@ def _parse_price_eur_from_text(text: str) -> Optional[int]:
     return max(candidates) if candidates else None
 
 def _fetch_live_price(url: str) -> Optional[int]:
-    try:
-        # cache
-        c = _LIVE_PRICE_CACHE.get(url)
-        if c and (time.time() - c["ts"] < _LIVE_PRICE_TTL):
-            return c["price"]
-
-        headers = {"User-Agent": "Mozilla/5.0 (compatible; STIGA-PriceBot/1.0)"}
-        resp = requests.get(url, headers=headers, timeout=10)
-        if resp.status_code != 200 or not resp.text:
-            _LIVE_PRICE_CACHE[url] = {"price": None, "ts": time.time()}
-            return None
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        # 1) meta con price (se presente)
-        meta = soup.find("meta", attrs={"itemprop": "price"}) or soup.find("meta", attrs={"property": "product:price:amount"})
-        if meta and meta.get("content"):
-            try:
-                price = int(float(meta["content"]))
-                _LIVE_PRICE_CACHE[url] = {"price": price, "ts": time.time()}
-                return price
-            except Exception:
-                pass
-
-        # 2) fallback: testo libero con simbolo €
-        text = soup.get_text(separator=" ", strip=True)
-        price = _parse_price_eur_from_text(text)
-        _LIVE_PRICE_CACHE[url] = {"price": price, "ts": time.time()}
-        return price
-    except Exception:
+    # cache
+    c = _LIVE_PRICE_CACHE.get(url)
+    if c and (time.time() - c["ts"] < _TTL_PRICE):
+        return c["price"]
+    soup = _get_soup(url)
+    if not soup:
         _LIVE_PRICE_CACHE[url] = {"price": None, "ts": time.time()}
         return None
+    # JSON-LD first
+    parsed = _parse_jsonld_price_and_image(soup)
+    if parsed.get("price"):
+        _LIVE_PRICE_CACHE[url] = {"price": parsed["price"], "ts": time.time()}
+        return parsed["price"]
+    # meta itemprop/OG fallback
+    meta = soup.find("meta", attrs={"itemprop": "price"}) or soup.find("meta", attrs={"property": "product:price:amount"})
+    if meta and meta.get("content"):
+        try:
+            price = int(float(meta["content"]))
+            _LIVE_PRICE_CACHE[url] = {"price": price, "ts": time.time()}
+            return price
+        except Exception:
+            pass
+    # full text fallback
+    text = soup.get_text(separator=" ", strip=True)
+    price = _parse_price_from_text(text)
+    _LIVE_PRICE_CACHE[url] = {"price": price, "ts": time.time()}
+    return price
 
-# --- Helpers per la Card ---
+def _fetch_live_image(url: str) -> Optional[str]:
+    # cache
+    c = _LIVE_IMAGE_CACHE.get(url)
+    if c and (time.time() - c["ts"] < _TTL_IMAGE):
+        return c["image"]
+    soup = _get_soup(url)
+    if not soup:
+        _LIVE_IMAGE_CACHE[url] = {"image": None, "ts": time.time()}
+        return None
+    # JSON-LD first
+    parsed = _parse_jsonld_price_and_image(soup)
+    if parsed.get("image"):
+        _LIVE_IMAGE_CACHE[url] = {"image": parsed["image"], "ts": time.time()}
+        return parsed["image"]
+    # OG/Twitter fallback
+    og = soup.find("meta", property="og:image") or soup.find("meta", attrs={"name": "og:image"})
+    if og and og.get("content"):
+        img = og["content"].strip()
+        _LIVE_IMAGE_CACHE[url] = {"image": img, "ts": time.time()}
+        return img
+    tw = soup.find("meta", property="twitter:image") or soup.find("meta", attrs={"name": "twitter:image"})
+    if tw and tw.get("content"):
+        img = tw["content"].strip()
+        _LIVE_IMAGE_CACHE[url] = {"image": img, "ts": time.time()}
+        return img
+    _LIVE_IMAGE_CACHE[url] = {"image": None, "ts": time.time()}
+    return None
+
+# -----------------------------
+#        CARD HELPERS
+# -----------------------------
+def _noise_value(p: Dict[str, Any]) -> Optional[float]:
+    snd = p.get("sound") or {}
+    return snd.get("lwa_measured_db", snd.get("lwa_guaranteed_db"))
+
+def _perimeter_label(perimeter_type: str) -> str:
+    mapping = {"virtual": "Virtuale", "wire": "Filo", "both": "Virtuale/Filo"}
+    return mapping.get(perimeter_type, perimeter_type)
+
 def build_card(p: Dict[str, Any], score: float) -> Card:
     cov = p.get("coverage_m2", "—")
     slope = p.get("max_slope_pct", "—")
@@ -114,14 +207,12 @@ def build_card(p: Dict[str, Any], score: float) -> Card:
     # prezzo formattato
     price_str = "—" if price_val is None else f"{int(price_val):,} €".replace(",", ".")
 
-    # specs essenziali
     specs = [
         SpecItem(label_it="Copertura", label_en="Coverage", value=f"{cov} m²"),
         SpecItem(label_it="Pendenza max", label_en="Max slope", value=f"{slope}%"),
         SpecItem(label_it="Perimetro", label_en="Perimeter", value=perim),
     ]
 
-    # solo PRO (max 3)
     pros: List[str] = []
     if p.get("wireless"): pros.append("Connettività wireless")
     if "rtk" in (p.get("features") or []): pros.append("Precisione RTK")
@@ -136,7 +227,6 @@ def build_card(p: Dict[str, Any], score: float) -> Card:
         lead={"label_it": "Richiedi consulenza", "label_en": "Request consultation", "action": "open_lead_form"}
     )
 
-    # titolo SENZA etichette di punteggio
     title_clean = p.get("name", "")
     subtitle = f"{cov} m² • {slope}% • {perim}"
 
@@ -147,13 +237,14 @@ def build_card(p: Dict[str, Any], score: float) -> Card:
         price=price_obj,
         specs=specs,
         pros=pros,
-        cons=[],              # <-- svantaggi rimossi
-        score=round(score, 1),# <-- resta interno per l’ordinamento, ma non lo mostreremo nel testo
+        cons=[],
+        score=round(score, 1),
         links=links
     )
 
-
-# --- Endpoint base ---
+# -----------------------------
+#         ENDPOINTS
+# -----------------------------
 @app.get("/health")
 def health():
     return {"status": "ok", "env": os.getenv("ENV", "unknown"), "products_loaded": len(PRODUCTS)}
@@ -162,7 +253,6 @@ def health():
 def list_products():
     return {"count": len(PRODUCTS), "items": PRODUCTS}
 
-# --- /products/search ---
 @app.get("/products/search", response_model=SearchResponse)
 def search_products(
     surface_m2: int,
@@ -174,7 +264,8 @@ def search_products(
     power_source: str = "any",
     features: Optional[str] = Query(None, description="CSV es: rtk,app,wireless"),
     limit: int = 5,
-    live_price: bool = False
+    live_price: bool = True,   # default: ON per coerenza prodotti
+    live_image: bool = True    # default: ON per coerenza prodotti
 ):
     q = SearchQuery(
         surface_m2=surface_m2,
@@ -191,29 +282,61 @@ def search_products(
     # 1) filtri duri
     filtered = hard_filters(PRODUCTS, q)
 
-    # 2) opzionale: aggiorna prezzi con lettura live dal PDP
-    if live_price:
-        enriched: List[Dict[str, Any]] = []
-        for p in filtered:
-            p2 = dict(p)  # copia shallow
-            url = p2.get("pdp_url")
-            if url:
-                lp = _fetch_live_price(url)
-                if lp:
-                    p2["price_eur"] = lp
-            enriched.append(p2)
-        filtered = enriched
+    # 2) arricchisci tutti con prezzo/immagine LIVE (skip se PDP non raggiungibile)
+    enriched: List[Dict[str, Any]] = []
+    for p in filtered:
+        p2 = dict(p)
+        url = p2.get("pdp_url")
+        if not url:
+            continue
+        soup = _get_soup(url)
+        if not soup:
+            # se la pagina non è raggiungibile, scarta il prodotto (evita link rotti)
+            continue
+
+        # image
+        if live_image:
+            img = _parse_jsonld_price_and_image(soup).get("image") or \
+                  (soup.find("meta", property="og:image") or soup.find("meta", attrs={"name": "og:image"}))
+            if isinstance(img, str):
+                p2["image_url"] = img
+            elif img and img.get("content"):
+                p2["image_url"] = img["content"].strip()
+            else:
+                # Twitter image fallback
+                tw = soup.find("meta", property="twitter:image") or soup.find("meta", attrs={"name": "twitter:image"})
+                if tw and tw.get("content"):
+                    p2["image_url"] = tw["content"].strip()
+
+        # price
+        if live_price:
+            lp = _parse_jsonld_price_and_image(soup).get("price")
+            if not lp:
+                meta = soup.find("meta", attrs={"itemprop": "price"}) or soup.find("meta", attrs={"property": "product:price:amount"})
+                if meta and meta.get("content"):
+                    try:
+                        lp = int(float(meta["content"]))
+                    except Exception:
+                        lp = None
+            if not lp:
+                text = soup.get_text(separator=" ", strip=True)
+                lp = _parse_price_from_text(text)
+            if lp:
+                p2["price_eur"] = lp
+
+        enriched.append(p2)
 
     # 3) scoring + build card
-    scored = [(p, score_product(p, q)) for p in filtered]
+    scored = [(p, score_product(p, q)) for p in enriched]
     scored.sort(key=lambda x: x[1], reverse=True)
     top = scored[:q.limit]
     cards = [build_card(p, s) for p, s in top]
 
     meta = {
-        "total": len(filtered),
+        "total": len(enriched),
         "limit": q.limit,
         "filters_applied": q.dict()
     }
 
     return SearchResponse(items=cards, meta=meta)
+
