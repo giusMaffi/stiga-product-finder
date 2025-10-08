@@ -1,0 +1,18 @@
+{
+  "schema_version": "v1",
+  "name_for_human": "STIGA Product Finder",
+  "name_for_model": "searchProducts",
+  "description_for_human": "Cerca prodotti STIGA per il taglio dell’erba in base a area, pendenza, perimetro, budget e altre caratteristiche.",
+  "description_for_model": "Find and rank STIGA lawn mowing products using filters like area, slope, perimeter, budget, noise, multizone, power source and features.",
+  "auth": {
+    "type": "none"
+  },
+  "api": {
+    "type": "openapi",
+    "url": "http://localhost:8080/docs",
+    "is_user_authenticated": false
+  },
+  "logo_url": "https://www.stiga.com/themes/custom/stiga/logo.svg",
+  "contact_email": "support@stiga.com",
+  "legal_info_url": "https://www.stiga.com/it/privacy"
+}
