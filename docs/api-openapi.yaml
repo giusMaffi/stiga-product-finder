@@ -1,0 +1,145 @@
+openapi: 3.0.3
+info:
+  title: STIGA Product Finder API
+  version: "1.0.0"
+servers:
+  - url: http://localhost:8080
+paths:
+  /products/search:
+    get:
+      operationId: searchProducts
+      summary: Cerca prodotti taglio erba con filtri duri e scoring
+      parameters:
+        - in: query
+          name: surface_m2
+          required: true
+          schema: { type: integer, minimum: 1 }
+          description: Area del prato in m²
+        - in: query
+          name: slope_pct
+          required: true
+          schema: { type: integer, minimum: 0 }
+          description: Pendenza massima in %
+        - in: query
+          name: perimeter
+          required: false
+          schema: { type: string, enum: [virtual, wire, both, any], default: any }
+        - in: query
+          name: budget_band
+          required: false
+          schema: { type: string, enum: [low, mid, high, any], default: any }
+        - in: query
+          name: noise_pref
+          required: false
+          schema: { type: number }
+          description: Rumorosità massima desiderata (dB-A)
+        - in: query
+          name: multizone
+          required: false
+          schema: { type: boolean }
+          description: Se l'utente ha più zone da gestire
+        - in: query
+          name: power_source
+          required: false
+          schema: { type: string, enum: [battery, wire, gasoline, any], default: any }
+        - in: query
+          name: features
+          required: false
+          schema: { type: string }
+          description: CSV di feature richieste (es. rtk,app,wireless)
+        - in: query
+          name: limit
+          required: false
+          schema: { type: integer, default: 5 }
+      responses:
+        "200":
+          description: Lista card ordinate per score
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        title: { type: string }
+                        subtitle: { type: string }
+                        image_url: { type: string, nullable: true }
+                        price:
+                          type: object
+                          properties:
+                            label: { type: string }
+                            note: { type: string, nullable: true }
+                        specs:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              label_it: { type: string }
+                              label_en: { type: string }
+                              value: { type: string }
+                        pros:
+                          type: array
+                          items: { type: string }
+                        cons:
+                          type: array
+                          items: { type: string }
+                        score: { type: number }
+                        links:
+                          type: object
+                          properties:
+                            pdp:
+                              type: object
+                              properties:
+                                label_it: { type: string }
+                                label_en: { type: string }
+                                url: { type: string }
+                            compare:
+                              type: object
+                              properties:
+                                label_it: { type: string }
+                                label_en: { type: string }
+                                action: { type: string }
+                            lead:
+                              type: object
+                              properties:
+                                label_it: { type: string }
+                                label_en: { type: string }
+                                action: { type: string }
+                  meta:
+                    type: object
+                    properties:
+                      total: { type: integer }
+                      limit: { type: integer }
+                      filters_applied: { type: object }
+  /leads:
+    post:
+      operationId: createLead
+      summary: Crea una richiesta di contatto/preventivo
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, email, phone]
+              properties:
+                name: { type: string }
+                email: { type: string, format: email }
+                phone: { type: string }
+                consent_marketing: { type: boolean, default: false }
+                context:
+                  type: object
+                  additionalProperties: true
+      responses:
+        "202":
+          description: Lead accettato
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: accepted }
+                  lead_id: { type: string, example: "uuid" }
